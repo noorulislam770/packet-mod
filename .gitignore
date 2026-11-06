@@ -1,3 +1,4 @@
 *.pcap
 *.pcapng
 venv/
+__pycache__/
