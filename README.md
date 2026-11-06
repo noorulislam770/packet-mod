@@ -36,6 +36,7 @@ The same protocol names work in both modes.
 | Name | Standard | Resulting frame |
 |------|----------|-----------------|
 | `vlan` | IEEE 802.1Q | Eth / 802.1Q / payload |
+| `qinq` (`dot1ad`) | IEEE 802.1ad | Eth / S-tag (0x88A8) / C-tag (0x8100) / payload. See [QinQ](#qinq). |
 | `vntag` | Cisco VN-Tag (0x8926) | Eth / VN-Tag / payload |
 | `fabricpath` | Cisco FabricPath (0x8903) | FabricPath outer header / original Eth frame |
 | `trill` | RFC 6325 (0x22F3) | Outer Eth / TRILL / Eth + 802.1Q / payload |
@@ -51,7 +52,7 @@ The same protocol names work in both modes.
 
 Names are case-insensitive, and `-` / `_` are ignored, so `VN-Tag`, `fabric_path` and `GTP-U` all work.
 
-**IP tunnels** (`gre`, `nvgre`, `vxlan`, `geneve`, `l2tp`, `lisp`, `gtp`) add an outer Ethernet + IPv4 header. **L2 tags** (`vlan`, `vntag`, `fabricpath`, `trill`, `ppp`, `none`) do not. This difference matters for fragmentation.
+**IP tunnels** (`gre`, `nvgre`, `vxlan`, `geneve`, `l2tp`, `lisp`, `gtp`) add an outer Ethernet + IPv4 header. **L2 tags** (`vlan`, `qinq`, `vntag`, `fabricpath`, `trill`, `ppp`, `none`) do not. This difference matters for fragmentation.
 
 ---
 
@@ -114,6 +115,9 @@ python3 packet-mod.py capture.pcap vxlan
 # Add an 802.1Q tag to every packet
 python3 packet-mod.py capture.pcap vlan
 
+# Make every packet QinQ (S-tag + C-tag; already-tagged packets get just the S-tag)
+python3 packet-mod.py capture.pcap qinq
+
 # GTP-U with ~40 % of the packets split into two outer-IP fragments
 python3 packet-mod.py capture.pcap gtp fragmented
 # -> capture-out-gtp-fragmented.pcap
@@ -130,17 +134,38 @@ The output is a classic little-endian pcap with microsecond timestamps and Ether
 
 ### What gets generated
 
-- **One coherent tunnel per run.** All random values (outer MACs and IPs, VLAN ID and PCP, VNI, VSID, TEID, GRE key, PPPoE session ID, TRILL nicknames, …) are chosen **once per run**. The whole output therefore looks like a single tunnel or tag set. Run the tool again to get different values.
+- **One coherent tunnel per run.** All random values (outer MACs and IPs, VLAN ID and PCP, QinQ S-VID and C-VID, VNI, VSID, TEID, GRE key, PPPoE session ID, TRILL nicknames, …) are chosen **once per run**. The whole output therefore looks like a single tunnel or tag set. Run the tool again to get different values.
 - **Outer addressing** for IP tunnels uses random locally administered MACs and `10.x.x.x` IPs. DF is set unless `fragmented` is used.
 - **Per-flow entropy.** VXLAN, GENEVE and LISP derive the UDP source port (49152–65535) from a hash of the inner MAC pair, as real VTEPs do. NVGRE uses the same hash for the 8-bit FlowID.
 - **GRE** always sets the Key and Sequence Number bits. The sequence number increases by one for every packet.
 - **GENEVE** carries one 8-byte option (experimental class `0xFFFF`) with random data.
-- **NVGRE and VXLAN** remove any 802.1Q tag from the inner frame (RFC 7637 §3.3, RFC 7348 §6.1).
+- **NVGRE and VXLAN** remove any 802.1Q or QinQ tags from the inner frame (RFC 7637 §3.3, RFC 7348 §6.1).
 - **TRILL** adds an 802.1Q tag to the inner frame. An inner multicast destination produces a multi-destination (M=1) frame to `01:80:c2:00:00:40`.
 - **Pass-through rules:**
   - `l2tp`, `ppp`, `lisp`, `gre` and `gtp` carry IP only. Non-IP frames (ARP, LLDP, …) are copied unchanged.
   - A packet that already carries the requested layer is copied unchanged (for example, VXLAN traffic in `vxlan` mode).
   - Frames shorter than 14 bytes are copied unchanged.
+
+### QinQ
+
+`qinq` behaves like an IEEE 802.1ad provider edge port. The result is always a QinQ frame with an S-tag (TPID `0x88A8`) followed by a C-tag (TPID `0x8100`):
+
+| Input frame | Result |
+|-------------|--------|
+| Untagged | An S-tag and a C-tag are added, both with random VID and PCP (DEI = 0). |
+| 802.1Q tagged (`0x8100`) | Only the S-tag is pushed on top. The existing tag becomes the C-tag and keeps its VID and PCP. |
+| Already S-tagged (`0x88A8` or legacy `0x9100`) | Copied unchanged. |
+
+Untagged and tagged packets in the same capture get the same S-VID, so the whole file looks like one service VLAN. Some vendors use `0x9100` or `0x8100` as the S-tag TPID; change `QINQ_S_TPID` at the top of the script to generate those instead.
+
+Every pcap-mode output is itself a valid input, so you can stack layers by running the tool more than once. For example, QinQ frames carried inside GENEVE:
+
+```bash
+python3 packet-mod.py capture.pcap qinq              # -> capture-out-qinq.pcap
+python3 packet-mod.py capture-out-qinq.pcap geneve   # -> Eth / IPv4 / UDP / GENEVE / Eth / S-tag / C-tag / IP
+```
+
+NVGRE and VXLAN remove the tags from the inner frame (see above), so they cannot carry QinQ.
 
 ### Fragmented mode
 
@@ -234,6 +259,9 @@ sudo python3 packet-mod.py ens1 geneve 10G wire mtu=9000 workers=8
 
 # Plain IPv4 traffic with fragmentation, no tunnel
 sudo python3 packet-mod.py ens1 none 1G fragment
+
+# 2 Gbit/s of QinQ (S-tag + C-tag, random VIDs per datagram) for 30 s
+sudo python3 packet-mod.py ens1 qinq 2G duration=30
 ```
 
 ### Sample output
@@ -256,7 +284,7 @@ done: 3,413,002 frames, 1,264,075 groups, 5.002 GB in 10.0s = 4.001 Gbit/s (targ
 ### What gets generated
 
 - **Header format is identical to pcap mode.** Replay mode calls the same `add_<protocol>` functions, so a GRE header always has Key + Sequence, GENEVE has one option, TRILL has an inner 802.1Q tag, and so on.
-- **Tunnel values vary between datagrams.** Each pre-built datagram gets its own random context: VNI, VSID/FlowID, TEID, GRE key, L2TP tunnel/session IDs, LISP instance ID, VLAN ID/PCP, VN-Tag VIFs, FabricPath addresses, TRILL nicknames, PPPoE session ID, … In pcap mode, by contrast, one set of values covers the whole file. Because every datagram has its own context, the GRE sequence number is a random value per datagram here, not a counter.
+- **Tunnel values vary between datagrams.** Each pre-built datagram gets its own random context: VNI, VSID/FlowID, TEID, GRE key, L2TP tunnel/session IDs, LISP instance ID, VLAN ID/PCP, QinQ S-VID/C-VID, VN-Tag VIFs, FabricPath addresses, TRILL nicknames, PPPoE session ID, … In pcap mode, by contrast, one set of values covers the whole file. Because every datagram has its own context, the GRE sequence number is a random value per datagram here, not a counter.
 - **Outer Ethernet:** source MAC is the interface's own MAC. Destination MAC is `02:00:00:00:00:02`.
 - **Outer IPv4:** source in `10.0.0.0/8`, destination in `172.16.0.0/24`, TTL 64, DF set unless fragmenting. Every group gets a **unique `(src IP, dst IP, IP ID)` tuple** for up to 2⁴⁸ groups, so fragments from different datagrams can never be reassembled together. This holds across all workers.
 - **Inner traffic (IP tunnels):** a random Ethernet frame with about 90 % IPv4 and 10 % IPv6. IPv4 carries UDP, TCP or ICMP, and IPv6 carries UDP or TCP. Inner addresses are random from `10/8` and `2001:db8::/32`.
