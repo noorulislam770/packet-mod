@@ -4,6 +4,8 @@ packet-mod.py - add an extra layer / tunnel to every packet in a pcap.
 
 Usage:
     python3 packet-mod.py file.pcap PROTOCOL [fragmented]
+    python3 packet-mod.py IFACE PROTOCOL SPEED [fragment] [wire] [duration=S] [mtu=N] [workers=N]
+        (replay mode, see "Replay mode" below)
 
 PROTOCOL is one of:
     vlan        IEEE 802.1Q tag
@@ -43,11 +45,45 @@ Notes:
     copied through unchanged.
   * NVGRE and VXLAN strip an 802.1Q tag from the inner frame (RFC 7637 3.3, RFC 7348 6.1).
   * A packet that already carries the layer is copied through unchanged.
+
+Replay mode (no input pcap):
+    python3 packet-mod.py ens1 gre 4G
+    python3 packet-mod.py ens1 gre 4G fragment
+    python3 packet-mod.py ens1 vxlan 800M fragment duration=60
+
+    Generates random traffic of the chosen tunnel / tag and sends it on IFACE at SPEED
+    until Ctrl-C (or duration=S). The tunnel / tag headers come from the same functions
+    as the pcap mode; the inner packets are random IPv4 (and some IPv6) UDP / TCP / ICMP
+    with valid checksums, and every pre-built datagram gets fresh random field values
+    (VNI, key, TEID, MACs, ...). PROTOCOL can also be "none" (plain IP traffic).
+    Needs root (AF_PACKET).
+      SPEED      K / M / G suffix, bits per second (4G = 4,000,000,000). Counted on frame
+                 bytes like tcpreplay -M; add "wire" to count FCS + preamble + IFG too.
+      fragment   every datagram is split into fragments at the MTU, so the sender emits
+                 groups of 2-4 fragments that reassemble into one valid packet.
+                   * IP based tunnels: the OUTER IPv4 packet is fragmented (fragment 1 =
+                     outer IP + UDP/GRE + tunnel header + start of the inner packet, the
+                     rest only outer IP + payload). The inner packet is not touched.
+                   * vlan, vntag, fabricpath, trill, ppp, none: the packet's own IPv4
+                     packet is fragmented and the tag is added to every fragment.
+                 Every fragment group has its own (src IP, dst IP, IP ID) tuple: the group
+                 number is mapped through a bijection, so no tuple is ever repeated, even
+                 across the parallel sender processes. UDP / TCP checksums are corrected
+                 for the group's addresses.
+      mtu=N      IP MTU used for sizing and fragmenting (default 1500; PPPoE takes 8 bytes
+                 off it). Outer IPv4 only.
+      workers=N  sender processes (default: picked from SPEED, at most one per cpu).
 """
+import errno
+import math
+import multiprocessing as mp
 import os
 import random
+import signal
+import socket
 import struct
 import sys
+import time
 import zlib
 
 from scapy.all import rdpcap, Ether, IP, UDP, GRE, Raw
@@ -426,10 +462,393 @@ PROTOCOLS = {
 
 
 # --------------------------------------------------------------------------
+# replay mode: random traffic of one protocol, sent on an interface at a given speed
+# --------------------------------------------------------------------------
+REPLAY_POOL_SIZE = 1024          # pre-built random datagrams per sender process (~1 ms each to build)
+REPLAY_REFRESH_EVERY = 1024      # replace one pool entry every N groups so field values keep changing
+REPLAY_MIN_FRAME = 60            # runt frames are padded to this size (no FCS), like a NIC does
+REPLAY_FPS_PER_WORKER = 90000    # frames/s one Python process is assumed to manage (picks the worker count)
+REPLAY_DST_MAC = "02:00:00:00:00:02"
+WIRE_OVERHEAD = 24               # FCS 4 + preamble 8 + IFG 12, counted with the "wire" option
+FRAGMENT_WORDS = ("fragmented", "fragment", "frag")
+IPV4_HEADER = struct.Struct("!BBHHHBBHII")
+GROUP_MASK = (1 << 48) - 1
+GROUP_MULTIPLIER = 0x9E3779B97F4B    # odd: n -> n * GROUP_MULTIPLIER mod 2^48 never repeats
+
+
+def rand_mac_bytes():
+    return bytes.fromhex(rand_mac().replace(":", ""))
+
+
+def words_sum(data):
+    """16-bit ones' complement sum of the words in data (folded, not inverted)."""
+    s = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return s
+
+
+def pseudo_header(src, dst, proto, length):
+    if len(src) == 4:
+        return src + dst + struct.pack("!BBH", 0, proto, length)
+    return src + dst + struct.pack("!I3xB", length, proto)
+
+
+def random_l4(length, src, dst):
+    """Random UDP / TCP / ICMP segment of exactly `length` bytes with a valid checksum."""
+    r = random.random()
+    proto = 17 if r < 0.6 else (6 if r < 0.9 else (1 if len(src) == 4 else 17))
+    if proto == 17:
+        seg = bytearray(struct.pack("!HHHH", random.randint(1024, 65535),
+                                    random.choice((53, 80, 123, 443, 5060, 8080)), length, 0))
+        seg += random.randbytes(length - 8)
+        seg[6:8] = struct.pack("!H", internet_checksum(pseudo_header(src, dst, 17, length) + bytes(seg)) or 0xFFFF)
+    elif proto == 6:
+        seg = bytearray(struct.pack("!HHIIBBHHH", random.randint(1024, 65535),
+                                    random.choice((80, 443, 8080, 3306)), random.getrandbits(32),
+                                    random.getrandbits(32), 5 << 4, random.choice((0x10, 0x18)),
+                                    random.getrandbits(16), 0, 0))
+        seg += random.randbytes(length - 20)
+        seg[16:18] = struct.pack("!H", internet_checksum(pseudo_header(src, dst, 6, length) + bytes(seg)))
+    else:
+        seg = bytearray(struct.pack("!BBHHH", 8, 0, 0, random.getrandbits(16), random.getrandbits(16)))
+        seg += random.randbytes(length - 8)
+        seg[2:4] = struct.pack("!H", internet_checksum(bytes(seg)))
+    return proto, bytes(seg)
+
+
+def random_ip_packet(length, allow_v6):
+    """Random IPv4 packet (IPv6 about 10% of the time if allowed) of exactly `length` bytes."""
+    if allow_v6 and random.random() < 0.1:
+        src = b"\x20\x01\x0d\xb8" + random.randbytes(12)
+        dst = b"\x20\x01\x0d\xb8" + random.randbytes(12)
+        proto, seg = random_l4(length - 40, src, dst)
+        return struct.pack("!IHBB", 0x60000000 | random.getrandbits(20), len(seg), proto,
+                           random.randint(32, 128)) + src + dst + seg
+    src, dst = socket.inet_aton(rand_ip()), socket.inet_aton(rand_ip())
+    proto, seg = random_l4(length - 20, src, dst)
+    hdr = struct.pack("!BBHHHBBH4s4s", 0x45, random.choice((0, 0, 0, 0x28, 0xB8)), 20 + len(seg),
+                      random.getrandbits(16), 0x4000, random.randint(32, 128), proto, 0, src, dst)
+    return hdr[:10] + struct.pack("!H", internet_checksum(hdr)) + hdr[12:] + seg
+
+
+def random_frame(length, dst_mac, src_mac, allow_v6):
+    ip = random_ip_packet(length, allow_v6)
+    return dst_mac + src_mac + (b"\x86\xdd" if ip[0] >> 4 == 6 else b"\x08\x00") + ip
+
+
+def split_datagram(payload, fragment, max_payload):
+    """[(offset, chunk, more_fragments)]; non-last chunks are multiples of 8 bytes (RFC 791)."""
+    if not fragment:
+        return [(0, payload, False)]
+    size = max_payload // 8 * 8
+    return [(pos, payload[pos:pos + size], pos + size < len(payload)) for pos in range(0, len(payload), size)]
+
+
+def frag_flags(pos, more, fragment):
+    """IPv4 flags + fragment offset: MF and offset when fragmenting, DF otherwise."""
+    return ((0x2000 if more else 0) | (pos >> 3)) if fragment else 0x4000
+
+
+def finish_entry(pieces, fix):
+    """pieces = [(head, flags_frag, ip_total_len, proto, chunk)] -> (fragments, frame_bytes, fix).
+    Everything that does not depend on the group (IP ID / src / dst) is computed here once."""
+    frags, total = [], 0
+    for head, ff, tl, proto, chunk in pieces:
+        pad = max(0, REPLAY_MIN_FRAME - len(head) - tl)           # pad is not part of the IP length
+        frags.append((head, ff, tl, 0x4500 + tl + ff + ((64 << 8) | proto), proto, chunk + bytes(pad)))
+        total += len(head) + tl + pad
+    return tuple(frags), total, fix
+
+
+def tunnel_entry(cfg, ctx, length, mtu):
+    """IP based tunnel: encapsulate a random inner frame with the pcap-mode function, then
+    cut the OUTER IPv4 payload into fragments. None if the size does not fit the mode."""
+    raw = random_frame(length, rand_mac_bytes(), rand_mac_bytes(), True)
+    out = cfg["func"](Ether(raw), raw, ctx)                       # Ether / IPv4 (no options) / ...
+    if out[12:14] != b"\x08\x00" or out[14] != 0x45:
+        raise RuntimeError("%s did not return an Ethernet / IPv4 frame" % cfg["name"])
+    proto, payload = out[23], out[34:14 + struct.unpack("!H", out[16:18])[0]]
+    if (len(payload) > mtu - 20) != cfg["fragment"]:
+        return None
+    fix = None
+    if proto == 17 and payload[6:8] != b"\0\0":                   # UDP checksum covers the outer addresses
+        fix = (6, words_sum(out[26:34]))
+    pieces = [(out[:14], frag_flags(pos, more, cfg["fragment"]), 20 + len(chunk), proto, chunk)
+              for pos, chunk, more in split_datagram(payload, cfg["fragment"], mtu - 20)]
+    return finish_entry(pieces, fix)
+
+
+def l2_entry(cfg, ctx, length, mtu):
+    """L2-only mode: fragment the packet's own IPv4 packet and let the pcap-mode function
+    add the tag / header to every fragment (as pcap mode does)."""
+    ip_pkt = random_ip_packet(length, False)
+    proto, src_dst = ip_pkt[9], ip_pkt[12:20]
+    fix = (6 if proto == 17 else 16, words_sum(src_dst)) if proto in (6, 17) else None
+    src, dst = struct.unpack("!II", src_dst)
+    link = cfg["dmac"] + cfg["smac"] + b"\x08\x00"
+    pieces = []
+    for pos, chunk, more in split_datagram(ip_pkt[20:], cfg["fragment"], mtu - 20):
+        ff, tl = frag_flags(pos, more, cfg["fragment"]), 20 + len(chunk)
+        ip = IPV4_HEADER.pack(0x45, 0, tl, 0, ff, 64, proto, 0, src, dst) + chunk
+        frame = link + ip
+        out = cfg["func"](Ether(frame), frame, ctx)
+        if not out.endswith(ip):
+            raise RuntimeError("%s does not keep the IPv4 packet at the end of the frame" % cfg["name"])
+        pieces.append((out[:len(out) - tl], ff, tl, proto, chunk))
+    return finish_entry(pieces, fix)
+
+
+def make_entry(cfg):
+    """One random, pre-built datagram. Its fields are fresh random values (own make_context()),
+    and nothing in it depends on the group's IP ID / src / dst, which are patched when sending."""
+    name, fragment = cfg["name"], cfg["fragment"]
+    l2_only = name in L2_ONLY
+    mtu = cfg["mtu"] - (8 if name in ("ppp", "pppoe") else 0)      # PPPoE + PPP come out of the MTU
+    ctx = make_context(fragment)
+    ctx["mac_src"], ctx["mac_dst"] = cfg["mac_src"], cfg["mac_dst"]
+    for _ in range(100):
+        if fragment:
+            length = random.randint(mtu + 1, 3 * mtu) if l2_only else random.randint(mtu - 100, 3 * mtu)
+        else:
+            top = mtu if l2_only else mtu - 90                       # leave room for the tunnel headers
+            length = random.randint(64, min(300, top)) if random.random() < 0.4 else random.randint(min(300, top), top)
+        entry = (l2_entry if l2_only else tunnel_entry)(cfg, ctx, max(length, 64), mtu)
+        if entry:
+            return entry
+    raise RuntimeError("could not size a %s datagram for mtu %d" % (name, cfg["mtu"]))
+
+
+def group_ids(n):
+    """Group number -> (IP ID, src, dst). The map is a bijection on 48 bits, so no
+    (src, dst, ID) tuple is ever used twice, which random IDs could not guarantee."""
+    x = (n * GROUP_MULTIPLIER) & GROUP_MASK
+    return x & 0xFFFF, 0x0A000000 | ((x >> 16) & 0xFFFFFF), 0xAC100000 | (x >> 40)
+
+
+def group_frames(entry, n):
+    """Frames of fragment group number n: IPv4 ID / src / dst / checksum patched in, and the
+    UDP / TCP checksum in the first fragment corrected for the new addresses (RFC 1624)."""
+    frags, _, fix = entry
+    ident, src, dst = group_ids(n)
+    addr_sum = (src >> 16) + (src & 0xFFFF) + (dst >> 16) + (dst & 0xFFFF)
+    out = []
+    for i, (head, ff, tl, partial, proto, payload) in enumerate(frags):
+        if fix and i == 0:
+            off, old = fix
+            s = (~((payload[off] << 8) | payload[off + 1]) & 0xFFFF) + (~old & 0xFFFF) + addr_sum
+            s = (s & 0xFFFF) + (s >> 16)
+            s = (s & 0xFFFF) + (s >> 16)
+            payload = payload[:off] + struct.pack("!H", ~s & 0xFFFF or 0xFFFF) + payload[off + 2:]
+        s = partial + ident + addr_sum
+        s = (s & 0xFFFF) + (s >> 16)
+        s = (s & 0xFFFF) + (s >> 16)
+        out.append(head + IPV4_HEADER.pack(0x45, 0, tl, ident, ff, 64, proto, ~s & 0xFFFF, src, dst) + payload)
+    return out
+
+
+def open_raw_socket(iface):
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0)
+    s.bind((iface, 0))
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 22)
+    except OSError:
+        pass
+    try:
+        s.setsockopt(263, 20, 1)          # SOL_PACKET, PACKET_QDISC_BYPASS
+    except OSError:
+        pass
+    return s
+
+
+def replay_worker(idx, nworkers, cfg, stats, stop):
+    """Send striped group numbers idx, idx + nworkers, ... paced to this worker's share of the speed."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    random.seed(os.urandom(16))                  # forked workers must not share one random sequence
+    pool = [make_entry(cfg) for _ in range(REPLAY_POOL_SIZE)]
+    send = open_raw_socket(cfg["iface"]).send
+    rate, overhead = cfg["rate"] / nworkers, cfg["overhead"]
+    perf = time.perf_counter
+    base = 5 * idx                               # stats slots: frames, bytes, groups, errors, active us
+    n, k = idx, 0
+    frames = nbytes = groups = errs = 0
+    bits = 0.0
+    t0 = t_begin = perf()
+    deadline = t0 + cfg["duration"] if cfg["duration"] else None
+    next_pub = t0 + 0.2
+    warned = False
+    while True:
+        entry = pool[random.randrange(REPLAY_POOL_SIZE)]
+        fl = group_frames(entry, n)
+        for f in fl:
+            while True:
+                try:
+                    send(f)
+                    break
+                except OSError as e:
+                    if e.errno in (errno.ENOBUFS, errno.EAGAIN, errno.EINTR):
+                        time.sleep(0.0001)       # tx queue full: wait for the NIC
+                        continue
+                    errs += 1
+                    if not warned:
+                        warned = True
+                        print("worker %d: send failed: %s (frame of %d bytes)" % (idx, e, len(f)), file=sys.stderr)
+                    break
+        n += nworkers
+        groups += 1
+        frames += len(fl)
+        nbytes += entry[1]
+        bits += (entry[1] + overhead * len(fl)) * 8
+        k += 1
+        if not k % REPLAY_REFRESH_EVERY:
+            pool[random.randrange(REPLAY_POOL_SIZE)] = make_entry(cfg)
+
+        due = t0 + bits / rate
+        now = perf()
+        if due > now:
+            if due - now > 0.0006:
+                time.sleep(due - now - 0.0004)
+            while perf() < due:
+                pass
+            now = perf()
+        elif now - due > 0.1:
+            t0 += now - due - 0.02               # fell far behind: drop the debt, no catch-up burst
+        if now >= next_pub:
+            stats[base:base + 5] = (frames, nbytes, groups, errs, int((now - t_begin) * 1e6))
+            next_pub = now + 0.2
+            if stop.is_set() or (deadline and now >= deadline):
+                break
+    stats[base:base + 5] = (frames, nbytes, groups, errs, int((perf() - t_begin) * 1e6))
+
+
+def parse_rate(text):
+    """'400M' / '4G' / '2.5g' / '10000000' -> bits per second."""
+    text = text.strip().lower()
+    for suffix in ("bps", "b"):
+        if text.endswith(suffix):
+            text = text[:-len(suffix)]
+            break
+    mult = 1
+    if text and text[-1] in "kmg":
+        mult = {"k": 1e3, "m": 1e6, "g": 1e9}[text[-1]]
+        text = text[:-1]
+    return float(text) * mult
+
+
+def replay_main(args):
+    """args = IFACE PROTOCOL SPEED [fragment] [wire] [duration=S] [mtu=N] [workers=N]"""
+    iface = args[0]
+    name = args[1].lower().replace("-", "").replace("_", "")
+    func = PROTOCOLS.get(name)
+    if func is None:
+        print("unknown protocol '%s' (choose from: %s)" % (args[1], ", ".join(PROTOCOLS)), file=sys.stderr)
+        return 2
+    try:
+        rate = parse_rate(args[2])
+        assert rate > 0
+    except (ValueError, AssertionError):
+        print("bad speed '%s' (examples: 400M, 4G, 2.5G)" % args[2], file=sys.stderr)
+        return 2
+    fragment, overhead, duration, mtu, workers = False, 0, 0.0, 1500, 0
+    try:
+        for opt in args[3:]:
+            opt = opt.lower()
+            if opt in FRAGMENT_WORDS:
+                fragment = True
+            elif opt == "wire":
+                overhead = WIRE_OVERHEAD
+            elif opt.startswith("duration="):
+                duration = float(opt[9:])
+            elif opt.startswith("mtu="):
+                mtu = int(opt[4:])
+            elif opt.startswith("workers="):
+                workers = int(opt[8:])
+            else:
+                print("unknown option '%s'" % opt, file=sys.stderr)
+                return 2
+    except ValueError:
+        print("bad option value in: %s" % " ".join(args[3:]), file=sys.stderr)
+        return 2
+    if not 576 <= mtu <= 16000:
+        print("mtu must be 576..16000", file=sys.stderr)
+        return 2
+
+    sysdir = "/sys/class/net/" + iface
+    if not os.path.isdir(sysdir):
+        print("'%s' is neither a pcap file nor an interface (interfaces: %s)" %
+              (iface, " ".join(os.listdir("/sys/class/net"))), file=sys.stderr)
+        return 2
+    smac = bytes.fromhex(open(sysdir + "/address").read().strip().replace(":", ""))
+    try:
+        open_raw_socket(iface).close()
+    except PermissionError:
+        print("raw sockets need root (CAP_NET_RAW)", file=sys.stderr)
+        return 1
+    try:
+        link = int(open(sysdir + "/speed").read())
+        if 0 < link * 1e6 < rate:
+            print("warning: asked for %.2f Gbit/s but the link speed of %s is %.2f Gbit/s" %
+                  (rate / 1e9, iface, link / 1e3), file=sys.stderr)
+    except (OSError, ValueError):
+        pass
+
+    ncpu = os.cpu_count() or 1
+    if not workers:
+        workers = max(1, min(ncpu, math.ceil(rate / 8000 / REPLAY_FPS_PER_WORKER)))
+    cfg = {"iface": iface, "name": name, "func": func, "fragment": fragment, "mtu": mtu, "rate": rate,
+           "overhead": overhead, "duration": duration, "smac": smac, "dmac": bytes.fromhex(REPLAY_DST_MAC.replace(":", "")),
+           "mac_src": ":".join("%02x" % b for b in smac), "mac_dst": REPLAY_DST_MAC}
+    print("%s: %s%s at %.3f Gbit/s (%s), mtu %d, %d worker(s) on %d cpu(s). Ctrl-C to stop." % (
+        iface, name, " + outer-IP fragmentation" if fragment and name not in L2_ONLY else
+        (" + IP fragmentation" if fragment else ""), rate / 1e9, "wire rate" if overhead else "frame bytes",
+        mtu, workers, ncpu))
+
+    ctx = mp.get_context("fork")
+    stats = ctx.RawArray("Q", 5 * workers)
+    stop = ctx.Event()
+    procs = [ctx.Process(target=replay_worker, args=(i, workers, cfg, stats, stop)) for i in range(workers)]
+    for p in procs:
+        p.start()
+
+    def totals():
+        s = list(stats)
+        return [sum(s[j::5]) for j in range(4)]
+
+    t_start = time.monotonic()
+    last_t, last = t_start, totals()
+    try:
+        while any(p.is_alive() for p in procs):
+            time.sleep(1.0)
+            now, cur = time.monotonic(), totals()
+            if cur[0] != last[0]:
+                dt = now - last_t
+                print("[%4.0fs] %6.3f Gbit/s  %9s frames/s  %8s groups/s  (total %s groups)" % (
+                    now - t_start, (cur[1] - last[1]) * 8 / dt / 1e9, format((cur[0] - last[0]) / dt, ",.0f"),
+                    format((cur[2] - last[2]) / dt, ",.0f"), format(cur[2], ",")), flush=True)
+            last_t, last = now, cur
+    except KeyboardInterrupt:
+        pass
+    stop.set()
+    for p in procs:
+        p.join()
+    frames, nbytes, groups, errs = totals()
+    elapsed = max(list(stats)[4::5]) / 1e6 or (time.monotonic() - t_start)   # time spent sending
+    achieved = (nbytes + overhead * frames) * 8 / elapsed
+    print("done: %s frames, %s groups, %.3f GB in %.1fs = %.3f Gbit/s (target %.3f)%s" % (
+        format(frames, ","), format(groups, ","), nbytes / 1e9, elapsed, achieved / 1e9, rate / 1e9,
+        ", %d send errors" % errs if errs else ""))
+    if achieved < 0.97 * rate:
+        print("warning: target speed not sustained - use more cpus / workers=N or a lower speed", file=sys.stderr)
+    return 0
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 def main():
     args = sys.argv[1:]
+    if len(args) >= 3 and not os.path.isfile(args[0]) and args[2].lower() not in FRAGMENT_WORDS:
+        sys.exit(replay_main(args))                  # IFACE PROTOCOL SPEED ...: replay mode
     fragmented = len(args) == 3 and args[2].lower() in ("fragmented", "fragment", "frag")
     if len(args) not in (2, 3) or (len(args) == 3 and not fragmented):
         sys.exit("usage: python3 packet-mod.py file.pcap PROTOCOL [fragmented]\n"
@@ -471,5 +890,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
