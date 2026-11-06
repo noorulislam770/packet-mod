@@ -9,6 +9,8 @@ Usage:
 
 PROTOCOL is one of:
     vlan        IEEE 802.1Q tag
+    qinq        IEEE 802.1ad QinQ: S-tag (0x88A8) + C-tag (0x8100). A frame that already has
+                an 802.1Q tag only gets the S-tag pushed on top (its tag becomes the C-tag).
     vntag       Cisco VN-Tag (ethertype 0x8926)
     fabricpath  Cisco FabricPath (16-byte MAC-in-MAC header, ethertype 0x8903)
     nvgre       NVGRE, RFC 7637 (Eth / IPv4 / GRE 0x6558 / original frame)
@@ -28,7 +30,7 @@ fragmented (optional third argument):
         packet is fragmented. Fragment 1 = outer IP header + UDP/GRE + tunnel header +
         the start of the inner packet (MF=1). Fragment 2 = outer IP header + the
         remaining payload only, with no UDP or tunnel header.
-      * other modes (vlan, vntag, fabricpath, trill, ppp): the packet's own IPv4
+      * other modes (vlan, qinq, vntag, fabricpath, trill, ppp): the packet's own IPv4
         header is fragmented the same way and the tag is added to each fragment.
     DF is cleared on the fragmented packets. IPv6, IP options and packets that are
     already fragments are left alone.
@@ -64,7 +66,7 @@ Replay mode (no input pcap):
                    * IP based tunnels: the OUTER IPv4 packet is fragmented (fragment 1 =
                      outer IP + UDP/GRE + tunnel header + start of the inner packet, the
                      rest only outer IP + payload). The inner packet is not touched.
-                   * vlan, vntag, fabricpath, trill, ppp, none: the packet's own IPv4
+                   * vlan, qinq, vntag, fabricpath, trill, ppp, none: the packet's own IPv4
                      packet is fragmented and the tag is added to every fragment.
                  Every fragment group has its own (src IP, dst IP, IP ID) tuple: the group
                  number is mapped through a bijection, so no tuple is ever repeated, even
@@ -89,9 +91,11 @@ import zlib
 from scapy.all import rdpcap, Ether, IP, UDP, GRE, Raw
 
 VLAN_TPIDS = (0x8100, 0x88A8, 0x9100)
+S_TAG_TPIDS = (0x88A8, 0x9100)   # outer (service) tag of a QinQ frame: 802.1ad and the legacy 0x9100
+QINQ_S_TPID = 0x88A8           # TPID written for the QinQ S-tag (IEEE 802.1ad)
 FRAGMENT_PROBABILITY = 0.4     # share of packets that get fragmented in "fragmented" mode
 MIN_FIRST_FRAGMENT = 32        # first fragment carries at least this many payload bytes
-L2_ONLY = ("vlan","none", "vntag", "fabricpath", "trill", "ppp", "pppoe")   # no outer IP header
+L2_ONLY = ("vlan", "qinq", "dot1ad", "none", "vntag", "fabricpath", "trill", "ppp", "pppoe")   # no outer IP header
 
 
 # --------------------------------------------------------------------------
@@ -265,6 +269,9 @@ def make_context(fragmented):
         "ip_flags": 0 if fragmented else "DF",
         # 802.1Q
         "vlan_id": random.randint(2, 4094), "vlan_pcp": random.randint(0, 7),
+        # 802.1ad QinQ: S-tag (service) + C-tag (customer)
+        "qinq_svid": random.randint(2, 4094), "qinq_spcp": random.randint(0, 7),
+        "qinq_cvid": random.randint(2, 4094), "qinq_cpcp": random.randint(0, 7),
         # VN-Tag
         "vn_dvif": random.randint(1, 0x3FFF), "vn_svif": random.randint(1, 0xFFF),
         # FabricPath
@@ -300,6 +307,24 @@ def add_vlan(pkt, raw, ctx):
         return raw
     tci = (ctx["vlan_pcp"] << 13) | ctx["vlan_id"]
     return raw[:12] + struct.pack("!HH", 0x8100, tci) + raw[12:]
+
+
+def add_qinq(pkt, raw, ctx):
+    """
+    IEEE 802.1ad QinQ: S-tag (TPID 0x88A8) followed by a C-tag (TPID 0x8100), each with
+    PCP(3) DEI(1)=0 VID(12). Works like a provider edge port:
+      * untagged frame       -> S-tag + C-tag are added
+      * 802.1Q tagged frame  -> only the S-tag is pushed; the existing tag becomes the C-tag
+      * already S-tagged     -> copied through unchanged
+    """
+    tpid = struct.unpack("!H", raw[12:14])[0]
+    if tpid in S_TAG_TPIDS:
+        return raw
+    s_tag = struct.pack("!HH", QINQ_S_TPID, (ctx["qinq_spcp"] << 13) | ctx["qinq_svid"])
+    if tpid == 0x8100:
+        return raw[:12] + s_tag + raw[12:]
+    c_tag = struct.pack("!HH", 0x8100, (ctx["qinq_cpcp"] << 13) | ctx["qinq_cvid"])
+    return raw[:12] + s_tag + c_tag + raw[12:]
 
 
 def add_vntag(pkt, raw, ctx):
@@ -444,6 +469,8 @@ def add_gtp(pkt, raw, ctx):
 
 PROTOCOLS = {
     "vlan": add_vlan,
+    "qinq": add_qinq,
+    "dot1ad": add_qinq,
     "none" : add_none,
     "vntag": add_vntag,
     "fabricpath": add_fabricpath,
